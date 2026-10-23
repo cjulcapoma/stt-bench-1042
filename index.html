@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Benchmark STT en el dispositivo (es) – #1042</title>
+<script>if(localStorage.getItem('coi')==='1'){window.coi={coepCredentialless:()=>false};document.write('<script src="coi-serviceworker.js"><\/script>');}</script>
+<style>body{font-family:system-ui,sans-serif;margin:12px;max-width:820px}fieldset{margin:8px 0;border:1px solid #ccc;border-radius:8px}button{padding:10px 14px;margin:4px 2px;font-size:15px}textarea{width:100%;box-sizing:border-box}pre{background:#f4f4f4;padding:8px;white-space:pre-wrap;word-break:break-all;font-size:12px}.ok{color:#080}.bad{color:#b00}table{border-collapse:collapse}td{padding:2px 8px;border-bottom:1px solid #eee}</style>
+</head><body>
+<h2>Benchmark de voz a texto en el dispositivo (español)</h2>
+<p>Todo se procesa en tu teléfono. <b>El audio nunca se sube a ningún servidor</b>; solo se descargan los modelos (CDN + Hugging Face).</p>
+<div id="env"></div>
+<fieldset><legend>1. Modelo</legend>
+<label>Modelo <select id="model"><option value="onnx-community/whisper-base">whisper-base</option><option value="onnx-community/whisper-small">whisper-small</option></select></label>
+<label>Dispositivo <select id="device"><option value="wasm">wasm (CPU)</option><option value="webgpu">webgpu</option></select></label>
+<label>Cuantización <select id="dtype"><option value="q8">q8</option><option value="q4">q4</option></select></label>
+<button id="load">Cargar modelo</button><div id="prog"></div></fieldset>
+<fieldset><legend>2. Audio</legend>
+<button id="useTest">Usar audio de prueba (~2 min)</button>
+<label>Subir archivo <input type="file" id="file" accept="audio/*,video/*"></label><br>
+<button id="rec">🎙️ Grabar</button><button id="stop" disabled>⏹ Detener</button>
+<div id="audioInfo"></div><audio id="player" controls style="width:100%"></audio>
+<p>Transcripción de referencia (para WER/CER):</p><textarea id="ref" rows="5"></textarea></fieldset>
+<fieldset><legend>3. Ejecutar</legend>
+<button id="run" disabled>Transcribir</button>
+<label><input type="checkbox" id="stripAcc" checked> quitar tildes al comparar</label>
+<div id="status"></div><p>Resultado:</p><textarea id="hyp" rows="6" readonly></textarea>
+<table id="metrics"></table></fieldset>
+<fieldset><legend>4. Reporte</legend><button id="copy">Copiar reporte</button> <span id="copied"></span><pre id="report"></pre></fieldset>
+<fieldset><legend>Opciones</legend><label><input type="checkbox" id="coi"> Activar aislamiento (coi-serviceworker, recarga la página; permite medir memoria y multihilo)</label></fieldset>
+<script type="module">
+const $=id=>document.getElementById(id);
+const S={runs:[],load:null,audio:null,audioSrc:null};
+// --- registro de red en la página ---
+const pageNet=[];let phase='inicio';
+const _f=window.fetch.bind(window);window.fetch=(i,o)=>{pageNet.push({phase,url:String(i.url||i),via:'fetch'});return _f(i,o)};
+const xo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u,...r){pageNet.push({phase,url:String(u),via:'xhr'});return xo.call(this,m,u,...r)};
+const pageRes=[];new PerformanceObserver(l=>{for(const e of l.getEntries())pageRes.push({phase,name:e.name,transferSize:e.transferSize,encodedBodySize:e.encodedBodySize})}).observe({type:'resource',buffered:true});
+// --- entorno ---
+const env={ua:navigator.userAgent,cores:navigator.hardwareConcurrency,deviceMemoryGB:navigator.deviceMemory??'no disponible',secure:isSecureContext,crossOriginIsolated:self.crossOriginIsolated,webgpu:'no'};
+$('coi').checked=localStorage.getItem('coi')==='1';$('coi').onchange=e=>{localStorage.setItem('coi',e.target.checked?'1':'0');location.reload()};
+async function checkGPU(){if(!navigator.gpu){env.webgpu='no (navigator.gpu ausente)';return}
+ try{const a=await navigator.gpu.requestAdapter();if(!a){env.webgpu='no (sin adapter)';return}
+ const i=a.info||(a.requestAdapterInfo?await a.requestAdapterInfo():{});env.webgpu='sí';env.gpu=[i.vendor,i.architecture,i.device,i.description].filter(Boolean).join(' ')||'?';env.gpuF16=a.features.has('shader-f16');}catch(e){env.webgpu='error: '+e.message}}
+await checkGPU();
+$('env').innerHTML=`<table>${Object.entries(env).map(([k,v])=>`<tr><td>${k}</td><td class="${v===false||String(v).startsWith('no')?'bad':''}">${v}</td></tr>`).join('')}</table>`;
+if(env.webgpu==='sí')$('device').value='webgpu';
+async function mem(){try{if(self.crossOriginIsolated&&performance.measureUserAgentSpecificMemory){const m=await performance.measureUserAgentSpecificMemory();return{metodo:'measureUserAgentSpecificMemory',MB:+(m.bytes/1048576).toFixed(1)}}}catch(e){}
+ if(performance.memory)return{metodo:'performance.memory (solo heap JS de la página, no incluye worker/WASM/GPU)',MB:+(performance.memory.usedJSHeapSize/1048576).toFixed(1)};return'no disponible'}
+// --- worker ---
+const w=new Worker('worker.js',{type:'module'});let waiter=null;
+w.onmessage=({data})=>{if(data.type==='progress'){const fs=Object.entries(data.files);const L=fs.reduce((a,[,f])=>a+f.loaded,0),Tt=fs.reduce((a,[,f])=>a+f.total,0);$('prog').textContent=`Descargando/cargando: ${(L/1048576).toFixed(1)} / ${(Tt/1048576).toFixed(1)} MB`;return}
+ const wt=waiter;waiter=null;wt&&wt(data)};
+const ask=msg=>new Promise(r=>{waiter=r;w.postMessage(msg)});
+const mb=b=>+(b/1048576).toFixed(2);
+$('load').onclick=async()=>{const cfg={model:$('model').value,device:$('device').value,dtype:$('dtype').value};$('load').disabled=true;phase='carga';
+ const t0=performance.now();const r=await ask({cmd:'load',...cfg});phase='inactivo';$('load').disabled=false;
+ if(r.type==='error'){$('prog').innerHTML=`<span class="bad">Error: ${r.message}</span>`;return}
+ const n=await ask({cmd:'net'});const mine=n.resEntries.filter(e=>e.phase==='carga'&&!S.seen?.has(e.name));
+ const model=n.resEntries.filter(e=>e.phase==='carga'&&/huggingface|hf\.co|xethub/.test(e.name));
+ const transfer=mine.reduce((a,e)=>a+(e.transferSize||0),0),encoded=mine.reduce((a,e)=>a+(e.encodedBodySize||0),0);
+ const pcbytes=Object.values(r.files).reduce((a,f)=>a+(f.total||0),0);
+ S.seen=new Set(n.resEntries.map(e=>e.name));
+ S.load={...cfg,version:r.version,totalMs:Math.round(performance.now()-t0),importMs:Math.round(r.tImport),pipelineMs:Math.round(r.tLoad),progressBytesMB:mb(pcbytes),transferMB:mb(transfer),encodedMB:mb(encoded),
+  modeloEnCacheAntes:r.cachedFiles>0,descargaModeloMB:r.cachedFiles>0?0:mb(pcbytes),cdnTransferMB:mb(transfer),nota:'HF no expone Timing-Allow-Origin: transferSize de huggingface.co=0; bytes de modelo vienen de progress_callback',cache:r.cachedFiles>0?'cache (segunda carga o más)':'red (primera carga)',files:Object.fromEntries(Object.entries(r.files).map(([k,f])=>[k,mb(f.total)])),mem:await mem()};
+ $('prog').innerHTML=`<span class="ok">Modelo listo</span> en ${(S.load.totalMs/1000).toFixed(1)} s — descarga modelo ${S.load.descargaModeloMB} MB + runtime CDN ${S.load.cdnTransferMB} MB (${S.load.cache}).`;
+ $('run').disabled=!S.audio;render()};
+// --- audio ---
+async function decode(buf,src){const ac=new AudioContext({sampleRate:16000});const ab=await ac.decodeAudioData(buf);ac.close();
+ let d=ab.getChannelData(0);if(ab.numberOfChannels>1){const b=ab.getChannelData(1);d=d.map((x,i)=>(x+b[i])/2)}
+ S.audio=new Float32Array(d);S.audioSrc=src;$('audioInfo').textContent=`Audio: ${src}, ${(S.audio.length/16000).toFixed(1)} s`;$('run').disabled=!S.load}
+$('useTest').onclick=async()=>{phase='audio';const b=await (await fetch('es-test.wav')).arrayBuffer();$('player').src='es-test.wav';$('ref').value=(await (await fetch('reference.txt')).text()).trim();phase='inactivo';await decode(b,'prueba MLS/LibriVox')};
+$('file').onchange=async e=>{const f=e.target.files[0];if(!f)return;$('player').src=URL.createObjectURL(f);await decode(await f.arrayBuffer(),'archivo subido: '+f.name)};
+let mr,chunks;$('rec').onclick=async()=>{try{const st=await navigator.mediaDevices.getUserMedia({audio:true});chunks=[];mr=new MediaRecorder(st);mr.ondataavailable=e=>chunks.push(e.data);
+ mr.onstop=async()=>{st.getTracks().forEach(t=>t.stop());const bl=new Blob(chunks,{type:mr.mimeType});$('player').src=URL.createObjectURL(bl);await decode(await bl.arrayBuffer(),'micrófono')};
+ mr.start();$('rec').disabled=true;$('stop').disabled=false;$('audioInfo').textContent='Grabando…'}catch(e){$('audioInfo').textContent='Micrófono no disponible: '+e.message}};
+$('stop').onclick=()=>{mr.stop();$('rec').disabled=false;$('stop').disabled=true};
+// --- métricas ---
+function norm(s){s=s.toLowerCase();if($('stripAcc').checked)s=s.normalize('NFD').replace(/[\u0300-\u036f]/g,'');return s.replace(/[^\p{L}\p{N}\s]/gu,' ').replace(/\s+/g,' ').trim()}
+function lev(a,b){let p=Array.from({length:b.length+1},(_,i)=>i);for(let i=1;i<=a.length;i++){const c=[i];for(let j=1;j<=b.length;j++)c[j]=Math.min(p[j]+1,c[j-1]+1,p[j-1]+(a[i-1]===b[j-1]?0:1));p=c}return p[b.length]}
+function errs(ref,hyp){const r=norm(ref),h=norm(hyp);if(!r)return{};const rw=r.split(' '),hw=h?h.split(' '):[];return{WER:+(lev(rw,hw)/rw.length*100).toFixed(1),CER:+(lev([...r.replace(/ /g,'')],[...h.replace(/ /g,'')])/r.replace(/ /g,'').length*100).toFixed(1)}}
+$('run').onclick=async()=>{$('run').disabled=true;$('status').textContent='Transcribiendo… (no cierres la pantalla)';const pn=pageNet.length,pr=pageRes.length;phase='transcripcion';
+ const audio=S.audio.slice();const r=await ask({cmd:'transcribe',audio});await new Promise(x=>setTimeout(x,300));phase='inactivo';$('run').disabled=false;
+ if(r.type==='error'){$('status').innerHTML=`<span class="bad">Error: ${r.message}</span>`;return}
+ const during=[...r.netDuring,...pageNet.slice(pn),...pageRes.slice(pr).map(e=>({url:e.name,via:'resource(página)'}))].filter(e=>!e.url.startsWith('blob:')&&!e.url.startsWith('data:'));
+ const sec=S.audio.length/16000;$('hyp').value=r.text.trim();$('status').textContent='Listo.';
+ S.runs.push({model:S.load.model.split('/')[1],device:S.load.device,dtype:S.load.dtype,audio:S.audioSrc,audioSec:+sec.toFixed(1),wallSec:+(r.ms/1000).toFixed(2),RTF_x:+(sec/(r.ms/1000)).toFixed(2),...errs($('ref').value,r.text),reqDuranteTranscripcion:during.length,reqLista:during.map(e=>e.url),mem:await mem(),texto:r.text.trim()});render()};
+async function render(){const n=await ask({cmd:'net'});const hosts=new Set();for(const u of[...n.netLog.map(e=>e.url),...n.resEntries.map(e=>e.name),...pageNet.map(e=>e.url),...pageRes.map(e=>e.name)]){try{const x=new URL(u,location.href);if(x.protocol.startsWith('http'))hosts.add(x.host)}catch{}}
+ const last=S.runs.at(-1);const rows=[];if(S.load)rows.push(['Carga modelo (s)',S.load.totalMs/1000],['Descarga modelo MB (progress) / runtime CDN MB (transferSize)',`${S.load.descargaModeloMB} / ${S.load.cdnTransferMB} (archivos: ${S.load.progressBytesMB} MB)`],['Origen',S.load.cache]);
+ if(last)rows.push(['Tiempo transcripción (s)',last.wallSec],['Velocidad (seg audio / seg proceso)',last.RTF_x+'×'],['WER %',last.WER??'—'],['CER %',last.CER??'—'],['Peticiones de red durante transcripción',last.reqDuranteTranscripcion===0?'0 ✅':last.reqDuranteTranscripcion+' ⚠️'],['Memoria',JSON.stringify(last.mem)]);
+ const H=new Set([...JSON.parse(localStorage.getItem('hosts')||'[]'),...hosts]);localStorage.setItem('hosts',JSON.stringify([...H]));hosts.clear();H.forEach(x=>hosts.add(x));
+ rows.push(['Hosts contactados (histórico en este navegador)',[...hosts].join(', ')]);$('metrics').innerHTML=rows.map(([a,b])=>`<tr><td>${a}</td><td>${b}</td></tr>`).join('');
+ const rep={bench:'stt-bench-1042',fecha:new Date().toISOString(),env,load:S.load,runs:S.runs.map(({texto,...r})=>({...r,texto:texto.slice(0,200)})),hosts:[...hosts],audioSubido:false};
+ const txt=S.runs.map(r=>`${r.model}/${r.device}/${r.dtype}: ${r.audioSec}s audio en ${r.wallSec}s (${r.RTF_x}× tiempo real), WER ${r.WER}% CER ${r.CER}%, red en transcripción: ${r.reqDuranteTranscripcion}`).join('\n');
+ S.report=`Benchmark STT #1042\n${env.ua}\nnúcleos ${env.cores}, RAM ${env.deviceMemoryGB} GB, WebGPU ${env.webgpu}\n${S.load?`carga ${S.load.model} ${S.load.device}/${S.load.dtype}: ${S.load.totalMs/1000}s, modelo ${S.load.descargaModeloMB} MB + CDN ${S.load.cdnTransferMB} MB (${S.load.cache})\n`:''}${txt}\nhosts: ${[...hosts].join(', ')}\n\n\`\`\`json\n${JSON.stringify(rep)}\n\`\`\``;$('report').textContent=S.report;window.__report=rep}
+$('copy').onclick=async()=>{await render();try{await navigator.clipboard.writeText(S.report);$('copied').textContent='¡Copiado! Pégalo en el chat.'}catch{const t=document.createElement('textarea');t.value=S.report;document.body.append(t);t.select();document.execCommand('copy');t.remove();$('copied').textContent='Copiado.'}};
+render();
+</script></body></html>
